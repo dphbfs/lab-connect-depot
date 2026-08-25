@@ -64,7 +64,15 @@ func run() error {
 	}
 	client := &controlClient{socketPath: sockPath}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "lab-connect-mcp", Version: "v1"}, nil)
+	// HasTools: true forces the "tools" capability into every session's
+	// initialize response even when zero Nodes are Paired yet — without
+	// it, the SDK only declares that capability if s.tools.len() > 0 *at
+	// the moment that session's initialize runs* (refreshTools adds tools
+	// asynchronously, on a delay, as Pairings appear). A client that
+	// connects before the first Pairing gets no "tools" capability and,
+	// per the MCP spec, is entitled to never call tools/list again for
+	// that session — even after a later listChanged notification.
+	server := mcp.NewServer(&mcp.Implementation{Name: "lab-connect-mcp", Version: "v1"}, &mcp.ServerOptions{HasTools: true})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
