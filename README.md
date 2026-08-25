@@ -2,7 +2,8 @@
 
 The **Gateway** image: a single Docker container bundling [Headscale](https://github.com/juanfont/headscale),
 its [admin UI](https://github.com/GoodiesHQ/headscale-admin), and an embedded
-[lab-connect](https://github.com/dphbfs/lab-connect) Runner + `lab-connect-mcp` MCP server.
+[lab-connect](https://github.com/dphbfs/lab-connect) Runner + `lab-connect-mcp` MCP server
+(`machines` / `execute` / `transport` — see "MCP tools" below).
 
 Normally, using lab-connect means standing up a Headscale (or Tailscale) mesh
 yourself first, then installing lab-connect on top of it. The Gateway collapses
@@ -31,14 +32,36 @@ dependency between the two repos:
   than importing that package (Go `internal/` packages aren't importable
   across repos/modules), documented in `cmd/lab-connect-mcp/main.go`.
 
+## MCP tools
+
+`lab-connect-mcp` exposes a fixed three-tool surface — none of these are
+added or removed at runtime; they just act on whatever is currently Paired:
+
+- **`machines`** — lists the Paired Nodes currently reachable by `execute`
+  and `transport`. An unpaired Node never shows up here, even if it exists
+  on the Overlay Network.
+- **`execute`** — `{machine, argv}`: runs a command on a paired machine.
+  **Unscoped full-shell** — no allow-list, no command-class restriction.
+  Every call is recorded as an Audit Entry on the target Node.
+- **`transport`** — `{machine, direction, path, content?}`: copies a file
+  onto (`upload`) or off of (`download`) a paired machine. There's no
+  dedicated file-transfer RPC on the Runner, so this reuses `execute`'s
+  RPC underneath (`content` travels as base64 in a single command
+  argument) — capped at roughly 1MiB, fine for configs/scripts, not for
+  large binaries.
+
+All three re-resolve the machine name against the live Peer list on every
+call — a machine that's unpaired or never existed is never actionable,
+regardless of what an agent cached from an earlier `machines` call.
+
 ## ⚠️ No auth on the MCP port (v1)
 
 The bundled `lab-connect-mcp` server listens on **8091 with no
 authentication** — matches lab-connect's own v1 posture of auto-approving every
 Pairing Request with no human gate (a single-operator POC trade-off, not
-a production security model). Its `run-command` tool is **unscoped
-full-shell**: whatever reaches port 8091 can run arbitrary commands on every
-Node this Gateway is Paired with.
+a production security model). Whatever reaches port 8091 can run arbitrary
+commands (and read/write files up to the transport cap) on every Node this
+Gateway is Paired with.
 
 **Firewall or VPN this port. Do not expose it to the open internet.**
 
