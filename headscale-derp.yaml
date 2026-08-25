@@ -1,0 +1,11 @@
+regions:
+  900:
+    regionid: 900
+    regioncode: gateway
+    regionname: Gateway (unused, DERP disabled)
+    nodes:
+      - name: gateway
+        regionid: 900
+        hostname: 127.0.0.1
+        stunport: 3478
+        stunonly: true

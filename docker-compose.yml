@@ -1,0 +1,26 @@
+# lab-connect-depot's own top-level compose — the Gateway image itself.
+# Not to be confused with lab-connect's dev-only docker-compose.yml
+# (distro test rigs for install.sh).
+#
+# v1 posture, stated plainly: the bundled MCP server at 8091 ships with NO
+# AUTH (run-command is unscoped full-shell). Firewall or VPN this port —
+# do not expose it to the open internet.
+services:
+  gateway:
+    build:
+      context: .
+    # host networking, not per-port mapping: the embedded Runner's tsnet
+    # node needs to be reachable by external Peers over WireGuard (UDP,
+    # ephemeral ports, real NAT traversal) for Pairing and run-command
+    # traffic to work at all — a bridge network's TCP-only port-forwards
+    # only cover headscale/admin-ui/MCP's own listeners, not the overlay
+    # data plane a paired peer actually dials into.
+    network_mode: host
+    volumes:
+      - headscale-data:/var/lib/headscale
+      - lab-connect-config:/data/lab-connect
+    restart: unless-stopped
+
+volumes:
+  headscale-data:
+  lab-connect-config:
