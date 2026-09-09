@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sync/errgroup"
 )
 
 // statePaired mirrors lab-connect's internal/pairing.StatePaired — the
@@ -58,6 +59,8 @@ func main() {
 func run() error {
 	addr := flag.String("addr", envOr("LAB_CONNECT_MCP_ADDR", ":8091"), "address to serve MCP over SSE/HTTP on")
 	stdio := flag.Bool("stdio", false, "serve MCP over stdio instead of SSE/HTTP (local/dev usage)")
+	uiAddr := flag.String("ui-addr", envOr("LAB_CONNECT_MCP_UI_ADDR", ":4224"), "address to serve the audit log UI + API on")
+	uiDir := flag.String("ui-dir", envOr("LAB_CONNECT_MCP_UI_DIR", "/srv/audit-ui"), "directory containing the built audit log UI's static files")
 	flag.Parse()
 
 	sockPath, err := controlSocketPath()
@@ -66,28 +69,50 @@ func run() error {
 	}
 	client := &controlClient{socketPath: sockPath}
 
+	auditPath, err := auditDataPath()
+	if err != nil {
+		return err
+	}
+	audit, err := openAuditLog(auditPath)
+	if err != nil {
+		return err
+	}
+
 	// HasTools: true forces the "tools" capability into every session's
 	// initialize response, matching a static tool set that's always
 	// present regardless of current Peer/Pairing state — see
 	// addMachinesTool/addExecuteTool/addTransportTool below, none of
 	// which are added or removed at runtime.
 	server := mcp.NewServer(&mcp.Implementation{Name: "lab-connect-mcp", Version: "v1"}, &mcp.ServerOptions{HasTools: true})
-	addMachinesTool(server, client)
-	addExecuteTool(server, client)
-	addTransportTool(server, client)
+	addMachinesTool(server, client, audit)
+	addExecuteTool(server, client, audit)
+	addTransportTool(server, client, audit)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The audit log UI + its API run on their own port regardless of MCP
+	// transport mode (stdio or HTTP) — it's an operator-facing inspection
+	// tool for the same audit_log this process already writes to, not
+	// part of the MCP protocol surface itself.
+	group, gctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return http.ListenAndServe(*uiAddr, uiServer(audit, *uiDir))
+	})
+
 	if *stdio {
-		return server.Run(ctx, &mcp.StdioTransport{})
+		group.Go(func() error { return server.Run(gctx, &mcp.StdioTransport{}) })
+		return group.Wait()
 	}
 
 	// Many concurrent AI-agent clients now hit this one process, so each
 	// gets its own MCP session id for free from the SDK (req.Session.ID())
 	// rather than a single id minted for the process lifetime.
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
-	return http.ListenAndServe(*addr, handler)
+	group.Go(func() error {
+		return http.ListenAndServe(*addr, handler)
+	})
+	return group.Wait()
 }
 
 func envOr(key, fallback string) string {
@@ -115,6 +140,17 @@ func pairedMachine(ctx context.Context, client *controlClient, name string) (pee
 	return peerInfo{}, fmt.Errorf("no paired machine named %q (call \"machines\" for the current list)", name)
 }
 
+// actorFromRequest builds the audit log's self-reported actor identity
+// from the calling session's MCP handshake — see CONTEXT.md "Actor".
+func actorFromRequest(req *mcp.CallToolRequest) auditActor {
+	actor := auditActor{SessionID: req.Session.ID()}
+	if params := req.Session.InitializeParams(); params != nil && params.ClientInfo != nil {
+		actor.Name = params.ClientInfo.Name
+		actor.Version = params.ClientInfo.Version
+	}
+	return actor
+}
+
 func errorResult(format string, args ...any) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		IsError: true,
@@ -126,7 +162,7 @@ func errorResult(format string, args ...any) *mcp.CallToolResult {
 
 type machinesInput struct{}
 
-func addMachinesTool(server *mcp.Server, client *controlClient) {
+func addMachinesTool(server *mcp.Server, client *controlClient, audit *auditLog) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "machines",
 		Description: "List the lab-connect machines currently available to \"execute\" and \"transport\" — " +
@@ -135,8 +171,10 @@ func addMachinesTool(server *mcp.Server, client *controlClient) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in machinesInput) (*mcp.CallToolResult, any, error) {
 		peers, err := client.Peers(ctx)
 		if err != nil {
+			audit.Record(ctx, auditCall{Tool: "machines", Actor: actorFromRequest(req), Status: noExitCode, Detail: err.Error()})
 			return errorResult("%s", err), nil, nil
 		}
+		audit.Record(ctx, auditCall{Tool: "machines", Actor: actorFromRequest(req), Status: 0})
 		var lines []string
 		for _, p := range peers {
 			if p.PairingState != statePaired {
@@ -166,7 +204,7 @@ type executeInput struct {
 	Argv    []string `json:"argv" jsonschema:"the command and its arguments as an argv-style array — e.g. [\"docker\",\"ps\"] — never a single shell string"`
 }
 
-func addExecuteTool(server *mcp.Server, client *controlClient) {
+func addExecuteTool(server *mcp.Server, client *controlClient, audit *auditLog) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "execute",
 		Description: "Run a command on a paired lab-connect machine (see \"machines\" for the current list). " +
@@ -175,17 +213,28 @@ func addExecuteTool(server *mcp.Server, client *controlClient) {
 			"Only call this against a machine you would hand full shell access to today. " +
 			"Every call is recorded as an Audit Entry on the target Node.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in executeInput) (*mcp.CallToolResult, any, error) {
+		actor := actorFromRequest(req)
 		if len(in.Argv) == 0 {
+			audit.Record(ctx, auditCall{Tool: "execute", Actor: actor, TargetName: in.Machine, Status: noExitCode, Detail: "argv must not be empty"})
 			return errorResult("argv must not be empty"), nil, nil
 		}
 		peer, err := pairedMachine(ctx, client, in.Machine)
 		if err != nil {
+			audit.Record(ctx, auditCall{Tool: "execute", Actor: actor, TargetName: in.Machine, Command: fmt.Sprint(in.Argv), Status: noExitCode, Detail: err.Error()})
 			return errorResult("%s", err), nil, nil
 		}
 		result, err := client.Run(ctx, peer.NodeKey, req.Session.ID(), in.Argv)
 		if err != nil {
+			audit.Record(ctx, auditCall{
+				Tool: "execute", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey,
+				Command: fmt.Sprint(in.Argv), Status: noExitCode, Detail: err.Error(),
+			})
 			return errorResult("%s", err), nil, nil
 		}
+		audit.Record(ctx, auditCall{
+			Tool: "execute", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey,
+			Command: fmt.Sprint(in.Argv), Status: result.ExitCode,
+		})
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{
 				Text: fmt.Sprintf("exit status %d\n%s", result.ExitCode, string(result.Output)),
@@ -210,7 +259,7 @@ type transportInput struct {
 // interpolating it into a shell string (avoids injection: the content
 // lands in $0, never parsed as script syntax). See maxTransportBytes for
 // the resulting size cap.
-func addTransportTool(server *mcp.Server, client *controlClient) {
+func addTransportTool(server *mcp.Server, client *controlClient, audit *auditLog) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "transport",
 		Description: fmt.Sprintf(
@@ -222,34 +271,43 @@ func addTransportTool(server *mcp.Server, client *controlClient) {
 			maxTransportBytes,
 		),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in transportInput) (*mcp.CallToolResult, any, error) {
+		actor := actorFromRequest(req)
 		if in.Path == "" {
+			audit.Record(ctx, auditCall{Tool: "transport", Actor: actor, TargetName: in.Machine, Status: noExitCode, Detail: "path must not be empty"})
 			return errorResult("path must not be empty"), nil, nil
 		}
 		peer, err := pairedMachine(ctx, client, in.Machine)
 		if err != nil {
+			audit.Record(ctx, auditCall{Tool: "transport", Actor: actor, TargetName: in.Machine, Status: noExitCode, Detail: err.Error()})
 			return errorResult("%s", err), nil, nil
 		}
 
 		switch in.Direction {
 		case "upload":
-			return doUpload(ctx, client, req.Session.ID(), peer, in)
+			return doUpload(ctx, client, audit, actor, req.Session.ID(), peer, in)
 		case "download":
-			return doDownload(ctx, client, req.Session.ID(), peer, in)
+			return doDownload(ctx, client, audit, actor, req.Session.ID(), peer, in)
 		default:
-			return errorResult("direction must be \"upload\" or \"download\", got %q", in.Direction), nil, nil
+			msg := fmt.Sprintf("direction must be \"upload\" or \"download\", got %q", in.Direction)
+			audit.Record(ctx, auditCall{Tool: "transport", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey, Status: noExitCode, Detail: msg})
+			return errorResult("%s", msg), nil, nil
 		}
 	})
 }
 
-func doUpload(ctx context.Context, client *controlClient, sessionID string, peer peerInfo, in transportInput) (*mcp.CallToolResult, any, error) {
+func doUpload(ctx context.Context, client *controlClient, audit *auditLog, actor auditActor, sessionID string, peer peerInfo, in transportInput) (*mcp.CallToolResult, any, error) {
+	reject := func(detail string) (*mcp.CallToolResult, any, error) {
+		audit.Record(ctx, auditCall{Tool: "transport", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey, Status: noExitCode, Detail: detail})
+		return errorResult("%s", detail), nil, nil
+	}
 	if in.Content == "" {
-		return errorResult("content (base64) is required for upload"), nil, nil
+		return reject("content (base64) is required for upload")
 	}
 	if len(in.Content) > (maxTransportBytes*4)/3+4 {
-		return errorResult("content exceeds the ~%d byte transport limit", maxTransportBytes), nil, nil
+		return reject(fmt.Sprintf("content exceeds the ~%d byte transport limit", maxTransportBytes))
 	}
 	if _, err := base64.StdEncoding.DecodeString(in.Content); err != nil {
-		return errorResult("content is not valid base64: %s", err), nil, nil
+		return reject(fmt.Sprintf("content is not valid base64: %s", err))
 	}
 
 	// sh -c SCRIPT ARG0 ARG1 sets $0=ARG0, $1=ARG1 inside SCRIPT — the
@@ -258,8 +316,12 @@ func doUpload(ctx context.Context, client *controlClient, sessionID string, peer
 	argv := []string{"sh", "-c", `printf '%s' "$0" | base64 -d > "$1"`, in.Content, in.Path}
 	result, err := client.Run(ctx, peer.NodeKey, sessionID, argv)
 	if err != nil {
-		return errorResult("%s", err), nil, nil
+		return reject(err.Error())
 	}
+	audit.Record(ctx, auditCall{
+		Tool: "transport", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey,
+		Command: fmt.Sprint(argv), Status: result.ExitCode,
+	})
 	if result.ExitCode != 0 {
 		return errorResult("upload to %s failed (exit status %d): %s", in.Path, result.ExitCode, string(result.Output)), nil, nil
 	}
@@ -268,12 +330,20 @@ func doUpload(ctx context.Context, client *controlClient, sessionID string, peer
 	}, nil, nil
 }
 
-func doDownload(ctx context.Context, client *controlClient, sessionID string, peer peerInfo, in transportInput) (*mcp.CallToolResult, any, error) {
+func doDownload(ctx context.Context, client *controlClient, audit *auditLog, actor auditActor, sessionID string, peer peerInfo, in transportInput) (*mcp.CallToolResult, any, error) {
 	argv := []string{"sh", "-c", `base64 "$0"`, in.Path}
 	result, err := client.Run(ctx, peer.NodeKey, sessionID, argv)
 	if err != nil {
+		audit.Record(ctx, auditCall{
+			Tool: "transport", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey,
+			Command: fmt.Sprint(argv), Status: noExitCode, Detail: err.Error(),
+		})
 		return errorResult("%s", err), nil, nil
 	}
+	audit.Record(ctx, auditCall{
+		Tool: "transport", Actor: actor, TargetName: peer.Name, TargetNodeKey: peer.NodeKey,
+		Command: fmt.Sprint(argv), Status: result.ExitCode,
+	})
 	if result.ExitCode != 0 {
 		return errorResult("download from %s failed (exit status %d): %s", in.Path, result.ExitCode, string(result.Output)), nil, nil
 	}

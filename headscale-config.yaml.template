@@ -1,0 +1,47 @@
+# Rendered by entrypoint.sh (sed) into /etc/headscale/config.yaml at
+# container start — __LAB_CONNECT_GATEWAY_IP__ is replaced with
+# LAB_CONNECT_GATEWAY_IP (default 127.0.0.1). It has to be a real
+# literal IP, known only at runtime, not this repo's build time:
+# server_url is what this Gateway advertises as its own address (used to
+# derive the embedded DERP region's hostname below when derp.server.ipv4
+# isn't set independently — see headscale's derp.md docs), and every
+# Peer that dials in over the WireGuard overlay needs that address to
+# actually be reachable, not a loopback literal that only ever resolves
+# to whichever machine is asking.
+server_url: http://__LAB_CONNECT_GATEWAY_IP__:8080
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: true
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+private_key_path: /var/lib/headscale/private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "headscale"
+    region_name: "lab-connect Embedded DERP"
+    private_key_path: /var/lib/headscale/derp_private.key
+    stun_listen_addr: 0.0.0.0:3478
+    ipv4: __LAB_CONNECT_GATEWAY_IP__
+  urls: []
+  auto_update_enabled: false
+disable_check_updates: true
+node:
+  ephemeral:
+    inactivity_timeout: 30m
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+log:
+  level: info
+dns:
+  magic_dns: false
+  override_local_dns: false
+  base_domain: lab-connect.internal

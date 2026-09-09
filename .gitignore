@@ -1,0 +1,6 @@
+/lab-connect-mcp
+/ui/node_modules/
+/ui/dist/
+/.agents/
+/.claude/
+/skills-lock.json

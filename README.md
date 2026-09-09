@@ -54,16 +54,31 @@ All three re-resolve the machine name against the live Peer list on every
 call — a machine that's unpaired or never existed is never actionable,
 regardless of what an agent cached from an earlier `machines` call.
 
-## ⚠️ No auth on the MCP port (v1)
+## Audit log
+
+Every call to `machines`, `execute`, and `transport` — including calls
+rejected before reaching a Node (unpaired machine, bad input) — is recorded
+as a row in a local SQLite database (`LAB_CONNECT_MCP_DATA_DIR`, default
+`~/.config/lab-connect-mcp/audit.db`): who called it (self-reported MCP
+`ClientInfo`, not authenticated), which machine, what command, and its
+real exit code, or `-1` if it never produced one. This is separate from
+lab-connect's own per-Node Audit Entry (`internal/rpc/audit.go` in the
+`lab-connect` repo) — see this repo's `CONTEXT.md` "Audit log" for how the
+two relate. A failure to write a row never blocks or fails the tool call
+itself.
+
+## ⚠️ No auth on the MCP port or the audit log UI (v1)
 
 The bundled `lab-connect-mcp` server listens on **8091 with no
 authentication** — matches lab-connect's own v1 posture of auto-approving every
 Pairing Request with no human gate (a single-operator POC trade-off, not
 a production security model). Whatever reaches port 8091 can run arbitrary
 commands (and read/write files up to the transport cap) on every Node this
-Gateway is Paired with.
+Gateway is Paired with. The audit log UI/API on **4224** has the same
+no-auth posture — anyone who can reach it can read every row, including
+command argv and rejection details.
 
-**Firewall or VPN this port. Do not expose it to the open internet.**
+**Firewall or VPN both ports. Do not expose either to the open internet.**
 
 ## Quickstart
 
@@ -87,6 +102,8 @@ supervisord. On success:
 - `http://localhost:8092` — headscale-admin UI
 - `http://localhost:8091` — `lab-connect-mcp`, SSE/HTTP transport (see the
   no-auth warning above)
+- `http://localhost:4224` — the audit log UI (React app + its JSON API,
+  same process, same no-auth posture as 8091 — see "Audit log" above)
 
 Point another machine's `lab-connect init` at this Gateway's published
 Headscale URL to join it as a Peer, then `lab-connect pair <name>` (v1

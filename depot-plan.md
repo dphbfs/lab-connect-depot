@@ -248,9 +248,111 @@ README states the no-auth posture up front.
 
 ---
 
+## Phase E — Audit log (SQLite, `lab-connect-mcp`)
+*(repo: `lab-connect-depot`, decided via grilling session)*
+
+**Why:** lab-connect's own per-Node Audit Entry (JSON-lines, `internal/rpc/audit.go`)
+only ever covers one machine at a time and has no notion of *which AI agent* made
+the call. `lab-connect-mcp` sees every call across every paired machine and the
+MCP handshake's `ClientInfo`, so it's the natural place for a unified log — see
+`CONTEXT.md`'s "Audit log" / "Actor" / "Target" entries (this repo) for the settled
+vocabulary.
+
+**New file:** `cmd/lab-connect-mcp/audit.go`. **New dependency:**
+`modernc.org/sqlite` (pure-Go, no cgo — keeps the Dockerfile's `CGO_ENABLED=0`
+alpine builder stage unchanged).
+
+**Table `audit_log`:**
+
+| column | type | notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | autoincrement rowid |
+| `timestamp` | `TEXT NOT NULL` | RFC 3339, written at call time |
+| `source` | `TEXT NOT NULL DEFAULT 'gateway'` | reserved value for a future push of lab-connect's own per-Node Audit Entries into this same table |
+| `tool` | `TEXT NOT NULL` | `machines` / `execute` / `transport` |
+| `actor_name` | `TEXT` | `ClientInfo.Name` from the MCP handshake — self-reported, not authenticated |
+| `actor_version` | `TEXT` | `ClientInfo.Version` |
+| `mcp_session_id` | `TEXT` | `req.Session.ID()` — same id threaded into the Node's own Audit Entry via `client.Run`, for future cross-referencing |
+| `target_name` | `TEXT` | `NULL` for `machines` (lists all Nodes, acts on none) |
+| `target_node_key` | `TEXT` | `NULL` for `machines`; resolved value from `pairedMachine`, not just the requested name |
+| `command` | `TEXT` | the literal argv sent to the Runner (same value passed to `client.Run`); `NULL` for `machines` |
+| `status` | `INTEGER NOT NULL` | the command's real exit code if it ran; `-1` if it never got one — connection error and pre-dispatch validation rejection (empty argv, unpaired machine, bad `direction`, oversized/invalid-base64 content) are both `-1`, distinguished via `detail`/`command`/`target_name`, not a second status code |
+| `detail` | `TEXT` | the error/rejection message only — never command output (output can be large and may carry secrets, e.g. a downloaded file's content) |
+
+**Behavior:**
+- Every call to all three tools (`machines`, `execute`, `transport`) gets exactly
+  one row, including calls rejected before any Runner dispatch.
+- Row is written synchronously, right before the tool returns its `CallToolResult`.
+- **Fail-open:** a write error is never surfaced to the caller and never fails the
+  tool call — log to the process's own stderr and move on. An audit log that can
+  block or fail the thing it's watching is worse than an occasional missed row.
+- DB file path: new env var `LAB_CONNECT_MCP_DATA_DIR` (default
+  `~/.config/lab-connect-mcp/audit.db`), **not** `LAB_CONNECT_CONFIG_DIR` — that
+  dir belongs to the Runner; this process owns its own data file even though both
+  happen to run in the same Gateway container.
+
+**Verify:** unit test in `cmd/lab-connect-mcp` covering: a successful `execute` row
+(`status` = real exit code), a non-zero-exit `execute` row (`status` = that exit
+code, not `-1`), a rejected `execute` row (unpaired machine → `status = -1`,
+`detail` set), a `machines` row (`target_name`/`target_node_key`/`command` all
+`NULL`), and that a broken/unwritable DB path doesn't fail the tool call itself.
+
+---
+
+## Phase F — Audit log UI + API (React, port 4224)
+*(repo: `lab-connect-depot`)*
+
+**Why:** Phase E's `audit_log` table is only queryable by hand (sqlite3
+against the running container). This phase adds an operator-facing viewer.
+
+**New directory:** `ui/` — a Vite + React app (`ui/src/App.jsx`), built to
+static files at `ui/dist/` (`npm run build`).
+
+**New file:** `cmd/lab-connect-mcp/audit_api.go` — `GET /api/audit-log`
+(`?limit=&offset=`, defaults 25 / max 500, newest-first) returning
+`{rows: [...], total: N}`; every `audit_log` column round-trips as JSON,
+`NULL` columns as JSON `null`. Served, same-origin, alongside the built
+`ui/dist` static files (`http.FileServer`) by a second HTTP listener the
+`lab-connect-mcp` process itself owns — not a separate binary or busybox
+httpd instance like `headscale-admin`'s, because the API needs the same
+process's open `*sql.DB` handle. New flags/env: `-ui-addr` /
+`LAB_CONNECT_MCP_UI_ADDR` (default `:4224`), `-ui-dir` /
+`LAB_CONNECT_MCP_UI_DIR` (default `/srv/audit-ui`, matching the
+`/srv/headscale-admin` convention already in the Dockerfile). Runs via
+`golang.org/x/sync/errgroup` alongside the MCP listener in both stdio and
+HTTP transport modes.
+
+**UI:** page-size dropdown (25/50/100/200), prev/next pagination, each row
+expandable (click) to show the full row — id, source, actor_version,
+mcp_session_id, target_node_key, command, detail — while the collapsed row
+shows only timestamp/tool/target/actor/status; dark/light toggle
+(`prefers-color-scheme` default, persisted to the viewer's own
+`localStorage`, not shared server state).
+
+**Dockerfile:** new `ui-builder` stage (`node:22-alpine`, `npm ci && npm
+run build`), `COPY --from=ui-builder /src/ui/dist /srv/audit-ui` in the
+final stage; `EXPOSE` gains `4224`. `supervisord.conf`'s existing
+`[program:lab-connect-mcp]` block needs no change — the UI/API listener is
+the same binary, same process, just a second port.
+
+**Security note carried into README:** 4224 has the same v1 no-auth
+posture as 8091 — it can read every audit row, including command argv and
+rejection `detail`. Same firewall/VPN guidance applies to both ports.
+
+**Verify:** Go test covering `/api/audit-log` pagination (newest-first
+ordering, limit clamping, `NULL` → JSON `null`); `npm run build` succeeds
+with no errors; manually load `http://localhost:4224`, confirm the table
+renders, page-size/pagination/expand/dark-mode all work against a
+container with seeded rows.
+
+---
+
 ## Order
 
 A → B → C → D. A and B (in `lab-connect`) are independently testable without
 Docker. C (in `lab-connect-depot`) depends on both being done and merged, since the
 submodule pin needs to point at a commit that has them. D can be written alongside
-C once the shape is real.
+C once the shape is real. E (audit log) is independent of A/B/C/D — it only touches
+`cmd/lab-connect-mcp` in this repo — and can land any time after this repo has that
+source (i.e. any time now). F (audit log UI) depends on E's `audit_log` table
+existing, but is otherwise independent of A/B/C/D too.

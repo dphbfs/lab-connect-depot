@@ -8,6 +8,17 @@ APIKEY_FILE="$CONFIG_DIR/gateway-headscale-apikey"
 mkdir -p "$CONFIG_DIR"
 export LAB_CONNECT_CONFIG_DIR="$CONFIG_DIR"
 
+# LAB_CONNECT_GATEWAY_IP: this Gateway's own address, as reachable by the
+# Peers that will dial into it — a real LAN IP for a normal deployment
+# (network_mode: host), or a container IP in a Docker-only sandbox.
+# Defaults to 127.0.0.1, which only ever works for same-host testing —
+# see headscale-config.yaml.template's own comment for why this can't be
+# baked in at build time. Rendered into the actual config file here,
+# every boot, so a restart with a changed IP (e.g. DHCP) still picks it
+# up.
+GATEWAY_IP="${LAB_CONNECT_GATEWAY_IP:-127.0.0.1}"
+sed "s|__LAB_CONNECT_GATEWAY_IP__|${GATEWAY_IP}|g" /etc/headscale/config.yaml.template >/etc/headscale/config.yaml
+
 echo "==> starting headscale"
 /usr/local/bin/headscale serve -c /etc/headscale/config.yaml &
 HEADSCALE_PID=$!

@@ -325,10 +325,23 @@ func TestMCPServer_DistinctSessionIDsPerConnection(t *testing.T) {
 // session to it.
 func connectTestClient(t *testing.T, client *controlClient) *mcp.ClientSession {
 	t.Helper()
+	cs, _ := connectTestClientWithAudit(t, client)
+	return cs
+}
+
+// connectTestClientWithAudit is connectTestClient plus access to the
+// auditLog it wired up, for tests asserting on audit_log rows directly.
+func connectTestClientWithAudit(t *testing.T, client *controlClient) (*mcp.ClientSession, *auditLog) {
+	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "lab-connect-mcp", Version: "test"}, &mcp.ServerOptions{HasTools: true})
-	addMachinesTool(server, client)
-	addExecuteTool(server, client)
-	addTransportTool(server, client)
+	audit, err := openAuditLog(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("openAuditLog() error: %v", err)
+	}
+	t.Cleanup(func() { audit.db.Close() })
+	addMachinesTool(server, client, audit)
+	addExecuteTool(server, client, audit)
+	addTransportTool(server, client, audit)
 
 	ctx := context.Background()
 	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
@@ -340,7 +353,7 @@ func connectTestClient(t *testing.T, client *controlClient) *mcp.ClientSession {
 	if err != nil {
 		t.Fatalf("client.Connect() error: %v", err)
 	}
-	return cs
+	return cs, audit
 }
 
 func toolResultText(t *testing.T, res *mcp.CallToolResult) string {
