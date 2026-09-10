@@ -14,7 +14,7 @@
 # entrypoint.sh depends on that flag existing) — check
 # https://github.com/dphbfs/lab-connect/releases before bumping "latest".
 
-ARG LAB_CONNECT_VERSION=v0.0.5-dev
+ARG LAB_CONNECT_VERSION=v0.0.6-dev
 ARG HEADSCALE_VERSION=0.29.3
 ARG HEADSCALE_ADMIN_VERSION=0.25.6
 
