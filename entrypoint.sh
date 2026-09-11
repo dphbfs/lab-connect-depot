@@ -8,16 +8,24 @@ APIKEY_FILE="$CONFIG_DIR/gateway-headscale-apikey"
 mkdir -p "$CONFIG_DIR"
 export LAB_CONNECT_CONFIG_DIR="$CONFIG_DIR"
 
-# LAB_CONNECT_GATEWAY_IP: this Gateway's own address, as reachable by the
-# Peers that will dial into it — a real LAN IP for a normal deployment
-# (network_mode: host), or a container IP in a Docker-only sandbox.
-# Defaults to 127.0.0.1, which only ever works for same-host testing —
-# see headscale-config.yaml.template's own comment for why this can't be
-# baked in at build time. Rendered into the actual config file here,
-# every boot, so a restart with a changed IP (e.g. DHCP) still picks it
-# up.
-GATEWAY_IP="${LAB_CONNECT_GATEWAY_IP:-127.0.0.1}"
-sed "s|__LAB_CONNECT_GATEWAY_IP__|${GATEWAY_IP}|g" /etc/headscale/config.yaml.template >/etc/headscale/config.yaml
+# LAB_CONNECT_GATEWAY_ADDR: this Gateway's own address as "host:port",
+# reachable by the Peers that will dial into it — a real LAN IP:8080 for a
+# normal deployment (network_mode: host), a container IP:8080 in a
+# Docker-only sandbox, or a different port when a host/NAT port mapping
+# (e.g. 8081:8080) or reverse proxy puts a different port in front of it.
+# Defaults to 127.0.0.1:8080, which only ever works for same-host testing
+# — see headscale-config.yaml.template's own comment for why this can't
+# be baked in at build time. Rendered into the actual config file here,
+# every boot, so a restart with a changed address (e.g. DHCP) still picks
+# it up. The host part alone also feeds derp.server.ipv4 — Headscale
+# derives the DERP region's advertised port from server_url, so this one
+# value fixes both the control-plane and DERP endpoints Peers are told to
+# dial.
+GATEWAY_ADDR="${LAB_CONNECT_GATEWAY_ADDR:-127.0.0.1:8080}"
+GATEWAY_HOST="${GATEWAY_ADDR%:*}"
+sed -e "s|__LAB_CONNECT_GATEWAY_ADDR__|${GATEWAY_ADDR}|g" \
+	-e "s|__LAB_CONNECT_GATEWAY_HOST__|${GATEWAY_HOST}|g" \
+	/etc/headscale/config.yaml.template >/etc/headscale/config.yaml
 
 echo "==> starting headscale"
 /usr/local/bin/headscale serve -c /etc/headscale/config.yaml &
