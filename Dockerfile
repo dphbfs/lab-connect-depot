@@ -71,6 +71,17 @@ RUN mkdir -p /srv/headscale-admin && \
 # wrongly reporting "lab-connect runner is not running". Still overridable
 # via docker-compose.yml's environment: like any other ENV default.
 ENV LAB_CONNECT_CONFIG_DIR=/data/lab-connect
+# Same reasoning, different directory: lab-connect's own tsnet node state
+# (WireGuard key, node CA — cmd/lab-connect/main.go's
+# dataDir/defaultNodeCADir) lives under $HOME/.local/share/lab-connect,
+# a path lab-connect's own code never made independently configurable.
+# Left at its container-default $HOME (ephemeral filesystem), every
+# recreate silently re-registers this Gateway as a brand-new node — new
+# key, new overlay IP — leaving orphaned "ghost" nodes behind and forcing
+# every Peer to re-learn its identity. Rooting $HOME inside the
+# already-persisted LAB_CONNECT_CONFIG_DIR volume fixes that with no
+# lab-connect code change and no extra volume mount.
+ENV HOME=/data/lab-connect/home
 
 COPY --from=builder /out/lab-connect-mcp /usr/local/bin/lab-connect-mcp
 # Audit log UI's static build — served directly by lab-connect-mcp itself

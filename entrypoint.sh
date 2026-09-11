@@ -8,6 +8,12 @@ APIKEY_FILE="$CONFIG_DIR/gateway-headscale-apikey"
 mkdir -p "$CONFIG_DIR"
 export LAB_CONNECT_CONFIG_DIR="$CONFIG_DIR"
 
+# $HOME defaults to the Dockerfile's own ENV (/data/lab-connect/home, on
+# the same persisted volume as CONFIG_DIR — see that ENV's comment for
+# why); just make sure it actually exists before anything tries to write
+# under it.
+mkdir -p "$HOME"
+
 # LAB_CONNECT_GATEWAY_ADDR: this Gateway's own address as "host:port",
 # reachable by the Peers that will dial into it — a real LAN IP:8080 for a
 # normal deployment (network_mode: host), a container IP:8080 in a
